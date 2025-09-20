@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PDF Coordinate Picker</title>
+  <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <style>
+    #canvasWrapper { position: relative; }
+    #markers div { transition: transform 0.2s; }
+
+    #xRuler { position: absolute; top:0; left:34px; height:24px; }
+    #yRuler { position: absolute; top:24px; left:0; width:34px; }
+    #xRulerBottom { position: absolute; top: calc(24px + 841.89px); left:34px; height:32px; width:595.28px; }
+    #yRulerRight { position: absolute; top:24px; left: calc(34px + 595.28px); width:24px; height:841.89px; }
+
+    #pdfCanvas, #gridCanvas, #markers {
+      position: absolute;
+      top: 24px;
+      left: 34px;
+      margin: 0;
+    }
+
+    #tooltip { white-space: pre; }
+  </style>
+</head>
+<body class="h-screen flex">
+
+  <aside class="w-48 bg-base-200 p-2 overflow-y-auto" id="sidebar">
+    <h2 class="text-lg font-bold mb-2">Pages</h2>
+    <div id="thumbnails" class="space-y-2"></div>
+  </aside>
+
+  <main class="flex-1 flex flex-col">
+    <div class="p-2 flex gap-2 items-center border-b">
+      <input type="file" id="fileInput" class="file-input file-input-bordered file-input-sm" />
+      <button id="toggleGrid" class="btn btn-sm">Toggle Grid</button>
+      <button id="zoomIn" class="btn btn-sm">Zoom +</button>
+      <button id="zoomOut" class="btn btn-sm">Zoom −</button>
+      <button id="undoMarker" class="btn btn-sm">Undo</button>
+      <button id="exportMarkers" class="btn btn-sm">Export JSON</button>
+      <button id="toggleTooltip" class="btn btn-sm">Toggle Tooltip</button>
+      <span id="coords" class="ml-auto text-sm opacity-70">x: -, y: -</span>
+      <input type="number" id="inputX" class="input input-sm input-bordered w-20" placeholder="X" readonly>
+      <input type="number" id="inputY" class="input input-sm input-bordered w-20" placeholder="Y" readonly>
+    </div>
+
+    <div class="flex-1 flex m-20 bg-base-100 select-none">
+      <div class="relative" id="canvasWrapper">
+        <canvas id="xRuler"></canvas>
+        <canvas id="yRuler"></canvas>
+        <canvas id="xRulerBottom"></canvas>
+        <canvas id="yRulerRight"></canvas>
+
+        <canvas id="pdfCanvas" class="shadow-lg"></canvas>
+        <canvas id="gridCanvas"></canvas>
+        <div id="markers"></div>
+
+        <div id="tooltip" class="absolute bg-black text-white text-xs px-1 py-0.5 rounded opacity-80 pointer-events-none hidden"></div>
+      </div>
+    </div>
+  </main>
+
+  <script type="module">
+    const fileInput = document.getElementById("fileInput");
+    const pdfCanvas = document.getElementById("pdfCanvas");
+    const gridCanvas = document.getElementById("gridCanvas");
+    const canvasWrapper = document.getElementById("canvasWrapper");
+    const markers = document.getElementById("markers");
+    const ctx = pdfCanvas.getContext("2d");
+    const gctx = gridCanvas.getContext("2d");
+    const coords = document.getElementById("coords");
+    const thumbnails = document.getElementById("thumbnails");
+
+    const xRuler = document.getElementById("xRuler");
+    const yRuler = document.getElementById("yRuler");
+    const xRulerBottom = document.getElementById("xRulerBottom");
+    const yRulerRight = document.getElementById("yRulerRight");
+    const xrCtx = xRuler.getContext("2d");
+    const yrCtx = yRuler.getContext("2d");
+    const xrBottomCtx = xRulerBottom.getContext("2d");
+    const yrRightCtx = yRulerRight.getContext("2d");
+
+    const tooltip = document.getElementById("tooltip");
+    let tooltipEnabled = false;
+
+    const inputX = document.getElementById("inputX");
+    const inputY = document.getElementById("inputY");
+
+    let pdfDoc = null, currentPage = 1, scale = 1, showGrid = false, currentViewport = null;
+    let markerCount = 0;
+    let markersData = [];
+    const rulerSize = 24; 
+    const gridStep = 50; 
+    const A4_WIDTH = 595.28;
+    const A4_HEIGHT = 841.89;
+
+    fileInput.addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const arrayBuffer = await file.arrayBuffer();
+      pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      loadThumbnails();
+      renderPage(1);
+    });
+
+    async function loadThumbnails() {
+      thumbnails.innerHTML = "";
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const viewport = page.getViewport({ scale: 0.2 });
+        const thumbCanvas = document.createElement("canvas");
+        thumbCanvas.width = viewport.width;
+        thumbCanvas.height = viewport.height;
+        await page.render({ canvasContext: thumbCanvas.getContext("2d"), viewport }).promise;
+        const btn = document.createElement("button");
+        btn.className = "block hover:ring-2 ring-primary rounded";
+        btn.appendChild(thumbCanvas);
+        btn.addEventListener("click", () => renderPage(i));
+        thumbnails.appendChild(btn);
+      }
+    }
+
+    async function renderPage(num) {
+      currentPage = num;
+      markerCount = 0;
+      markersData = [];
+      const page = await pdfDoc.getPage(num);
+
+      pdfCanvas.width = A4_WIDTH;
+      pdfCanvas.height = A4_HEIGHT;
+      gridCanvas.width = A4_WIDTH;
+      gridCanvas.height = A4_HEIGHT;
+      markers.style.width = A4_WIDTH + "px";
+      markers.style.height = A4_HEIGHT + "px";
+
+      const pageViewport = page.getViewport({ scale: 1 });
+      const scaleX = A4_WIDTH / pageViewport.width;
+      const scaleY = A4_HEIGHT / pageViewport.height;
+      scale = Math.min(scaleX, scaleY);
+      currentViewport = page.getViewport({ scale });
+
+      markers.innerHTML = "";
+      await page.render({ canvasContext: ctx, viewport: currentViewport }).promise;
+
+      drawGrid();
+      updateRulers();
+    }
+
+    function drawGrid() {
+      gctx.clearRect(0, 0, gridCanvas.width, gridCanvas.height);
+      if (!showGrid) return;
+      gctx.strokeStyle = "rgba(0,0,0,0.15)";
+      gctx.lineWidth = 1;
+
+      for (let x = 0; x <= A4_WIDTH; x += gridStep) {
+        gctx.beginPath();
+        gctx.moveTo(x, 0);
+        gctx.lineTo(x, A4_HEIGHT);
+        gctx.stroke();
+      }
+
+      for (let y = 0; y <= A4_HEIGHT; y += gridStep) {
+        const py = A4_HEIGHT - y;
+        gctx.beginPath();
+        gctx.moveTo(0, py);
+        gctx.lineTo(A4_WIDTH, py);
+        gctx.stroke();
+      }
+    }
+
+    function updateRulers() {
+      const offset = 2;
+
+      // Top X ruler
+      xRuler.width = A4_WIDTH;
+      xRuler.height = rulerSize;
+      xrCtx.clearRect(0, 0, xRuler.width, xRuler.height);
+      xrCtx.fillStyle = "#333";
+      xrCtx.font = "10px Arial";
+      xrCtx.textAlign = "center";
+      xrCtx.textBaseline = "top";
+      for (let x = 0; x <= A4_WIDTH; x += gridStep) {
+        xrCtx.beginPath();
+        xrCtx.moveTo(x, rulerSize);
+        xrCtx.lineTo(x, 14);
+        xrCtx.stroke();
+        xrCtx.fillText(x, x, 2);
+      }
+
+      // Bottom X ruler (increased height)
+      xRulerBottom.width = A4_WIDTH;
+      xRulerBottom.height = 32; // increased from 24
+      xrBottomCtx.clearRect(0, 0, xRulerBottom.width, xRulerBottom.height);
+      xrBottomCtx.fillStyle = "#333";
+      xrBottomCtx.font = "10px Arial";
+      xrBottomCtx.textAlign = "center";
+      xrBottomCtx.textBaseline = "top";
+      for (let x = 0; x <= A4_WIDTH; x += gridStep) {
+        xrBottomCtx.beginPath();
+        xrBottomCtx.moveTo(x, 4); // offset for dash
+        xrBottomCtx.lineTo(x, 12);
+        xrBottomCtx.stroke();
+        xrBottomCtx.fillText(x, x, 14); // place number below dash
+      }
+
+      // Left Y ruler
+      yRuler.width = 34;
+      yRuler.height = A4_HEIGHT;
+      yrCtx.clearRect(0, 0, yRuler.width, yRuler.height);
+      yrCtx.fillStyle = "#333";
+      yrCtx.font = "10px Arial";
+      yrCtx.textAlign = "right";
+      yrCtx.textBaseline = "middle";
+      for (let y = 0; y <= A4_HEIGHT; y += gridStep) {
+        const py = A4_HEIGHT - y + offset;
+        yrCtx.beginPath();
+        yrCtx.moveTo(34, py);
+        yrCtx.lineTo(24, py);
+        yrCtx.stroke();
+        yrCtx.fillText(`${y}-`, 29, py);
+      }
+
+      // Right Y ruler
+      yRulerRight.width = 24;
+      yRulerRight.height = A4_HEIGHT;
+      yrRightCtx.clearRect(0, 0, yRulerRight.width, yRulerRight.height);
+      yrRightCtx.fillStyle = "#333";
+      yrRightCtx.font = "10px Arial";
+      yrRightCtx.textAlign = "left";
+      yrRightCtx.textBaseline = "middle";
+      for (let y = 0; y <= A4_HEIGHT; y += gridStep) {
+        const py = A4_HEIGHT - y + offset;
+        yrRightCtx.beginPath();
+        yrRightCtx.moveTo(0, py);
+        yrRightCtx.lineTo(6, py);
+        yrRightCtx.stroke();
+        yrRightCtx.fillText(`${y}-`, 8, py);
+      }
+    }
+
+    canvasWrapper.addEventListener("mousemove", (e) => {
+      const rect = gridCanvas.getBoundingClientRect();
+      const xCanvas = e.clientX - rect.left;
+      const yCanvas = e.clientY - rect.top;
+      const pdfX = Math.round(xCanvas);
+      const pdfY = Math.round(A4_HEIGHT - yCanvas);
+
+      coords.textContent = `x: ${pdfX}, y: ${pdfY}`;
+      inputX.value = pdfX;
+      inputY.value = pdfY;
+
+      if (tooltipEnabled) {
+        tooltip.style.display = "block";
+        tooltip.style.left = `${xCanvas + 10}px`;
+        tooltip.style.top = `${yCanvas + 10}px`;
+        tooltip.textContent = `x: ${pdfX}\ny: ${pdfY}`;
+      } else {
+        tooltip.style.display = "none";
+      }
+    });
+
+    canvasWrapper.addEventListener("click", (e) => {
+      const rect = gridCanvas.getBoundingClientRect();
+      const xCanvas = e.clientX - rect.left;
+      const yCanvas = e.clientY - rect.top;
+      const pdfX = Math.round(xCanvas);
+      const pdfY = Math.round(A4_HEIGHT - yCanvas);
+
+      inputX.value = pdfX;
+      inputY.value = pdfY;
+
+      if (pdfX < 0 || pdfX > A4_WIDTH || pdfY < 0 || pdfY > A4_HEIGHT) return;
+
+      markerCount++;
+      const label = `#${markerCount}`;
+      const markerSize = 24;
+      const marker = document.createElement("div");
+      marker.className = "absolute flex items-center justify-center w-6 h-6 bg-primary text-white text-xs font-bold rounded-full border border-white shadow";
+      marker.style.left = `${xCanvas - markerSize / 2}px`;
+      marker.style.top = `${yCanvas - markerSize / 2}px`;
+      marker.textContent = markerCount;
+      markers.appendChild(marker);
+
+      markersData.push({ label, x: pdfX, y: pdfY, element: marker });
+      const coordText = `${label} → x: ${pdfX}, y: ${pdfY}`;
+      navigator.clipboard.writeText(coordText).catch(() => {});
+      console.log("Clicked:", coordText);
+    });
+
+    document.getElementById("toggleGrid").addEventListener("click", () => { showGrid = !showGrid; drawGrid(); });
+    document.getElementById("toggleTooltip").addEventListener("click", () => { tooltipEnabled = !tooltipEnabled; tooltip.style.display = tooltipEnabled ? "block" : "none"; });
+    document.getElementById("zoomIn").addEventListener("click", () => { scale *= 1.2; renderPage(currentPage); });
+    document.getElementById("zoomOut").addEventListener("click", () => { scale = Math.max(0.5, scale / 1.2); renderPage(currentPage); });
+    document.getElementById("undoMarker").addEventListener("click", () => { if (markersData.length === 0) return; const lastMarker = markersData.pop(); lastMarker.element.remove(); markerCount = markersData.length; });
+    document.getElementById("exportMarkers").addEventListener("click", () => { const exportData = markersData.map(m => ({ label: m.label, x: m.x, y: m.y })); const json = JSON.stringify(exportData, null, 2); navigator.clipboard.writeText(json).catch(() => {}); alert("Markers JSON copied to clipboard!\n" + json); console.log("Exported Markers JSON:", json); });
+  </script>
+</body>
+</html>
